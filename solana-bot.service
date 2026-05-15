@@ -1,0 +1,24 @@
+[Unit]
+Description=Solana Momentum Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=conrad
+WorkingDirectory=/home/conrad/.openclaw/workspace/solana-bot
+ExecStart=/usr/bin/node /home/conrad/.openclaw/workspace/solana-bot/dist/bot.js
+Restart=on-failure
+RestartSec=10s
+StandardOutput=append:/home/conrad/.openclaw/workspace/solana-bot/logs/service-out.log
+StandardError=append:/home/conrad/.openclaw/workspace/solana-bot/logs/service-err.log
+
+# Environment — or use EnvironmentFile if you prefer
+EnvironmentFile=/home/conrad/.openclaw/workspace/solana-bot/.env
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
