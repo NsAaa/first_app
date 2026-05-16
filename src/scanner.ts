@@ -107,6 +107,63 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// ─── DexScreener Rate Limiter ──────────────────────────────────────────────────────
+// Serialises all DexScreener HTTP calls through a single queue with a minimum
+// gap of DEX_MIN_INTERVAL_MS between requests. Prevents IP rate-bans caused by
+// concurrent scanner + position-monitor bursts hitting DexScreener from the
+// same home IP.
+const DEX_MIN_INTERVAL_MS = 1_000; // max 1 req/s to DexScreener
+let _dexLastCallAt = 0;
+let _dexQueue: Array<() => void> = [];
+let _dexQueueRunning = false;
+
+async function dexThrottledGet(url: string, options?: object): Promise<any> {
+  return new Promise((resolve, reject) => {
+    _dexQueue.push(async () => {
+      try {
+        const now = Date.now();
+        const wait = Math.max(0, _dexLastCallAt + DEX_MIN_INTERVAL_MS - now);
+        if (wait > 0) await sleep(wait);
+        _dexLastCallAt = Date.now();
+        const resp = await fetchWithBackoff(() => axios.get(url, { timeout: 10_000, ...options }));
+        resolve(resp);
+      } catch (err) {
+        reject(err);
+      }
+    });
+    if (!_dexQueueRunning) _drainDexQueue();
+  });
+}
+
+async function _drainDexQueue(): Promise<void> {
+  _dexQueueRunning = true;
+  while (_dexQueue.length > 0) {
+    const next = _dexQueue.shift()!;
+    await next();
+  }
+  _dexQueueRunning = false;
+}
+
+// ─── token-profiles Cache ──────────────────────────────────────────────────────
+// DexScreener token-profiles/latest/v1 only refreshes every ~30s on their end.
+// Sharing one cached copy between fetchNewPairs and fetchSniperCandidates halves
+// the number of hits to that endpoint per scan cycle.
+const TOKEN_PROFILES_CACHE_TTL_MS = 30_000;
+let _tokenProfilesCache: { data: any[]; fetchedAt: number } | null = null;
+
+async function getTokenProfiles(): Promise<any[]> {
+  const now = Date.now();
+  if (_tokenProfilesCache && now - _tokenProfilesCache.fetchedAt < TOKEN_PROFILES_CACHE_TTL_MS) {
+    logger.debug('token-profiles: cache hit');
+    return _tokenProfilesCache.data;
+  }
+  const resp = await dexThrottledGet('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 12_000 });
+  const data: any[] = Array.isArray(resp.data) ? resp.data : (resp.data?.data || []);
+  _tokenProfilesCache = { data, fetchedAt: Date.now() };
+  logger.debug(`token-profiles: fetched ${data.length} profiles (cache refreshed)`);
+  return data;
+}
+
 // Solana tokens to search — mix of established tokens + trending memecoins
 // These are searched by ticker so DexScreener returns all pairs for each
 const SEARCH_TICKERS = [
@@ -127,13 +184,11 @@ async function fetchDexScreenerTrending(): Promise<TokenCandidate[]> {
   // Search each ticker — DexScreener returns all pairs for matching tokens
   for (const ticker of SEARCH_TICKERS) {
     try {
-      const resp = await fetchWithBackoff(() =>
-        axios.get(`${DEXSCREENER_API}/search?q=${ticker}`, { timeout: 12_000 })
-      );
+      const resp = await dexThrottledGet(`${DEXSCREENER_API}/search?q=${ticker}`, { timeout: 12_000 });
       const tickerPairs: any[] = (resp.data?.pairs || []).filter((p: any) => p.chainId === 'solana');
       pairs.push(...tickerPairs);
     } catch (_) {}
-    await sleep(200); // gentle pacing
+    await sleep(500); // gentle pacing — reduced DexScreener hammering
   }
 
   const candidates: TokenCandidate[] = [];
@@ -327,14 +382,8 @@ async function checkResistanceBreak(mint: string, currentPriceUsd: number): Prom
 // then fetches pair data to apply momentum + rug filters.
 async function fetchNewPairs(): Promise<TokenCandidate[]> {
   try {
-    // Get latest token profiles (freshly listed tokens on DexScreener)
-    const profileResp = await fetchWithBackoff(() =>
-      axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 12_000 })
-    );
-
-    const profiles: any[] = Array.isArray(profileResp.data)
-      ? profileResp.data
-      : (profileResp.data?.data || []);
+    // Get latest token profiles — shared cached copy (refreshes every 30s)
+    const profiles = await getTokenProfiles();
 
     const solanaAddresses = profiles
       .filter((p: any) => p.chainId === 'solana' && p.tokenAddress)
@@ -343,16 +392,14 @@ async function fetchNewPairs(): Promise<TokenCandidate[]> {
 
     if (solanaAddresses.length === 0) return [];
 
-    // Fetch pair data for each token in batches
+    // Fetch pair data for each token — throttled to max 1 req/s
     const candidates: TokenCandidate[] = [];
 
     for (const address of solanaAddresses) {
       try {
         if (BLACKLISTED_MINTS.has(address)) continue;
 
-        const resp = await fetchWithBackoff(() =>
-          axios.get(`${DEXSCREENER_API}/tokens/${address}`, { timeout: 10_000 })
-        );
+        const resp = await dexThrottledGet(`${DEXSCREENER_API}/tokens/${address}`, { timeout: 10_000 });
 
         const pairs: any[] = (resp.data?.pairs || []).filter((p: any) => p.chainId === 'solana');
         if (pairs.length === 0) continue;
@@ -426,8 +473,7 @@ async function fetchNewPairs(): Promise<TokenCandidate[]> {
           source: 'dexscreener-new',
         });
 
-        await sleep(200); // gentle pacing
-      } catch (_) {}
+        } catch (_) {}
     }
 
     logger.debug(`New token scan: ${candidates.length} candidates (from ${solanaAddresses.length} profiles)`);
@@ -443,13 +489,8 @@ async function fetchNewPairs(): Promise<TokenCandidate[]> {
 // Very aggressive — expects lots of SL hits but hunting for explosive early movers.
 async function fetchSniperCandidates(): Promise<TokenCandidate[]> {
   try {
-    const profileResp = await fetchWithBackoff(() =>
-      axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 12_000 })
-    );
-
-    const profiles: any[] = Array.isArray(profileResp.data)
-      ? profileResp.data
-      : (profileResp.data?.data || []);
+    // Shared cached profiles — won't double-hit the endpoint if fetchNewPairs ran first
+    const profiles = await getTokenProfiles();
 
     const solanaAddresses = profiles
       .filter((p: any) => p.chainId === 'solana' && p.tokenAddress)
@@ -464,9 +505,7 @@ async function fetchSniperCandidates(): Promise<TokenCandidate[]> {
       try {
         if (BLACKLISTED_MINTS.has(address)) continue;
 
-        const resp = await fetchWithBackoff(() =>
-          axios.get(`${DEXSCREENER_API}/tokens/${address}`, { timeout: 10_000 })
-        );
+        const resp = await dexThrottledGet(`${DEXSCREENER_API}/tokens/${address}`, { timeout: 10_000 });
 
         const pairs: any[] = (resp.data?.pairs || []).filter((p: any) => p.chainId === 'solana');
         if (pairs.length === 0) continue;
@@ -532,8 +571,6 @@ async function fetchSniperCandidates(): Promise<TokenCandidate[]> {
           score,
           source: 'sniper',
         });
-
-        await sleep(200);
       } catch (_) {}
     }
 
@@ -658,7 +695,7 @@ export async function getCurrentPrice(mint: string): Promise<number | null> {
 
   // 2. DexScreener (fallback — has 15-30s REST cache lag but broad token coverage)
   try {
-    const resp = await axios.get(`${DEXSCREENER_API}/tokens/${mint}`, { timeout: 5_000 });
+    const resp = await dexThrottledGet(`${DEXSCREENER_API}/tokens/${mint}`, { timeout: 5_000 });
     const pairs: any[] = resp.data?.pairs || [];
     const solana = pairs.filter((p: any) => p.chainId === 'solana');
     if (solana.length > 0) {

@@ -127,6 +127,12 @@ export const DUMP_THRESHOLD_PCT = 0.08;   // 8% drop in one monitor cycle = dump
 export const DUMP_LOOKBACK_CYCLES = 3;    // also exit if price down 10% over last 3 cycles (~30s)
 export const DUMP_TREND_PCT = 0.10;       // 10% drop over lookback window triggers exit
 
+// ─── Price Spike Guard ───────────────────────────────────────────────────────
+// If fetched price is more than SPIKE_MULTIPLIER × entry price in a single
+// monitor cycle, cross-validate before acting — protects against bad Jupiter /
+// DexScreener quotes triggering phantom take-profits.
+export const PRICE_SPIKE_MULTIPLIER = 10; // 10× entry price in one cycle = suspected glitch
+
 // ─── Timing ───────────────────────────────────────────────────────────────────
 export const SCAN_INTERVAL_MIN_MS = 10_000;    // 10 seconds
 export const SCAN_INTERVAL_MAX_MS = 30_000;    // 30 seconds (random jitter)

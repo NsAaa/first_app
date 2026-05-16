@@ -18,6 +18,7 @@ import {
   DUMP_THRESHOLD_PCT,
   DUMP_LOOKBACK_CYCLES,
   DUMP_TREND_PCT,
+  PRICE_SPIKE_MULTIPLIER,
   DRY_RUN,
 } from './config';
 import {
@@ -212,11 +213,37 @@ export async function monitorPositions(getCurrentPrice: (mint: string) => Promis
         continue;
       }
 
+      // Update current price in state (imported early — also used by spike guard below)
+      const { updatePosition } = await import('./state');
+
+      // ─── Price Spike Guard ──────────────────────────────────────────────────
+      // If price is >PRICE_SPIKE_MULTIPLIER× entry in a single cycle, cross-validate
+      // before acting. Protects against bad Jupiter/DexScreener quotes firing
+      // phantom take-profits (e.g. the BTC6900 $0.001268 → $1.20 glitch).
+      if (priceUsd > pos.entryPriceUsd * PRICE_SPIKE_MULTIPLIER) {
+        logger.warn(
+          `${pos.tokenSymbol} suspected price spike: $${pos.entryPriceUsd.toFixed(6)} → $${priceUsd.toFixed(6)} ` +
+          `(${(priceUsd / pos.entryPriceUsd).toFixed(0)}× entry) — cross-validating...`
+        );
+        await new Promise(r => setTimeout(r, 2_000)); // wait 2s
+        const confirmedSpike = await getCurrentPrice(pos.tokenMint);
+        if (!confirmedSpike || confirmedSpike < pos.entryPriceUsd * PRICE_SPIKE_MULTIPLIER) {
+          // Not confirmed — likely a data glitch, skip this cycle
+          logger.info(
+            `${pos.tokenSymbol} spike NOT confirmed ` +
+            `(confirmed: $${confirmedSpike?.toFixed(6) ?? 'null'}) — likely data glitch, skipping cycle`
+          );
+          updatePosition(pos.id, { currentPriceUsd: confirmedSpike ?? pos.currentPriceUsd ?? pos.entryPriceUsd });
+          continue;
+        }
+        // Confirmed — it's a real pump! Let the normal TP/trailing logic handle it.
+        logger.info(
+          `${pos.tokenSymbol} spike CONFIRMED — real pump at $${confirmedSpike.toFixed(6)}, proceeding with close`
+        );
+      }
+
       const pnlPct = (priceUsd - pos.entryPriceUsd) / pos.entryPriceUsd * 100;
       logger.debug(`${pos.tokenSymbol}: $${priceUsd.toFixed(6)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
-
-      // Update current price in state
-      const { updatePosition } = await import('./state');
 
       // ─── Dump / Liquidity Grab Detection ───────────────────────────────────
       // Maintains a rolling price history. Exits early if:
