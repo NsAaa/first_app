@@ -15,6 +15,7 @@ import {
   HIGH_WATERMARK_ACTIVATE,
   HIGH_WATERMARK_TRAIL_PCT,
   SNIPER_TRAIL_PCT,
+  TIER_TRAIL_PCT,
   DUMP_THRESHOLD_PCT,
   DUMP_LOOKBACK_CYCLES,
   DUMP_TREND_PCT,
@@ -299,6 +300,17 @@ export async function monitorPositions(getCurrentPrice: (mint: string) => Promis
         }
       }
 
+      // ─── Universal Peak Tracking (non-sniper) ───────────────────────────────
+      // Track highest price seen every cycle from entry, for all non-sniper tiers.
+      // This ensures the tier trailing stop always has an accurate peak reference.
+      if (!pos.isSniper) {
+        const currentPeak = pos.peakPriceUsd ?? priceUsd;
+        const newPeak = Math.max(currentPeak, priceUsd);
+        if (newPeak > currentPeak) {
+          updatePosition(pos.id, { peakPriceUsd: newPeak });
+        }
+      }
+
       // ─── Near-TP Trailing Stop ──────────────────────────────────────────────
       // Activates when price is within NEAR_TP_THRESHOLD (5%) of take profit.
       // Tracks peak price; if it drops NEAR_TP_TRAIL_PCT (3%) from peak → close.
@@ -383,6 +395,28 @@ export async function monitorPositions(getCurrentPrice: (mint: string) => Promis
           continue;
         }
         continue; // sniper positions skip normal SL/TP checks
+      }
+
+      // ─── Tier Trailing Stop (New + Established) ─────────────────────────────────
+      // 10% trailing stop from peak price, tracked every cycle from entry.
+      // Fires if price drops 10%+ from highest seen — replaces fixed SL as the
+      // primary exit for drawdowns. Fixed TP still applies (checked below).
+      {
+        const peak = pos.peakPriceUsd ?? priceUsd;
+        const dropFromPeak = (peak - priceUsd) / peak;
+        if (dropFromPeak >= TIER_TRAIL_PCT) {
+          const pnlUsd = (priceUsd - pos.entryPriceUsd) / pos.entryPriceUsd * pos.usdSpent;
+          const isProfit = pnlUsd >= 0;
+          const tier = pos.isNewToken ? 'New' : 'Established';
+          logger.info(`📉 ${tier} trailing stop: ${pos.tokenSymbol} — peak $${peak.toFixed(8)} → now $${priceUsd.toFixed(8)} (${(dropFromPeak*100).toFixed(1)}% drop) | P&L: ${isProfit?'+':''}$${pnlUsd.toFixed(2)}`);
+          if (isProfit) {
+            await alertTakeProfit({ symbol: pos.tokenSymbol, mint: pos.tokenMint, pnlUsd, pnlPct, dryRun: DRY_RUN });
+          } else {
+            await alertStopLoss({ symbol: pos.tokenSymbol, mint: pos.tokenMint, pnlUsd, pnlPct, dryRun: DRY_RUN });
+          }
+          await executeClose(pos, isProfit ? 'take_profit' : 'stop_loss', priceUsd);
+          continue;
+        }
       }
 
       // Check limit sell (manual target price — takes priority over SL/TP)
