@@ -243,6 +243,37 @@ export async function monitorPositions(getCurrentPrice: (mint: string) => Promis
         );
       }
 
+      // ─── Price Crash Guard ─────────────────────────────────────────────────
+      // Mirror of the spike guard but for sudden downward glitches from Jupiter/
+      // DexScreener (e.g. ORCA $1.44 → $0.000625, BOME $0.000567 → $0.00000024).
+      // If price drops >50% from entry in a single cycle, cross-validate before
+      // allowing any stop-loss or exit logic to fire.
+      const recentAvg = (pos.priceHistory ?? []).length > 0
+        ? (pos.priceHistory as number[]).reduce((a, b) => a + b, 0) / (pos.priceHistory as number[]).length
+        : pos.entryPriceUsd;
+      const crashThreshold = recentAvg * 0.5; // >50% drop from recent avg = suspected glitch
+      if (priceUsd < crashThreshold) {
+        logger.warn(
+          `${pos.tokenSymbol} suspected price crash glitch: recent avg $${recentAvg.toFixed(6)} → $${priceUsd.toFixed(6)} ` +
+          `(${((1 - priceUsd / recentAvg) * 100).toFixed(1)}% drop) — cross-validating...`
+        );
+        await new Promise(r => setTimeout(r, 2_000)); // wait 2s
+        const confirmedCrash = await getCurrentPrice(pos.tokenMint);
+        if (!confirmedCrash || confirmedCrash >= crashThreshold) {
+          // Not confirmed — bad API quote, skip this cycle
+          logger.info(
+            `${pos.tokenSymbol} crash NOT confirmed ` +
+            `(confirmed: $${confirmedCrash?.toFixed(6) ?? 'null'}) — likely API glitch, skipping cycle`
+          );
+          updatePosition(pos.id, { currentPriceUsd: confirmedCrash ?? pos.currentPriceUsd ?? pos.entryPriceUsd });
+          continue;
+        }
+        // Confirmed crash — let normal SL logic handle it
+        logger.warn(
+          `${pos.tokenSymbol} crash CONFIRMED at $${confirmedCrash.toFixed(6)}, proceeding with exit logic`
+        );
+      }
+
       const pnlPct = (priceUsd - pos.entryPriceUsd) / pos.entryPriceUsd * 100;
       logger.debug(`${pos.tokenSymbol}: $${priceUsd.toFixed(6)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
 
