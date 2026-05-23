@@ -44,6 +44,7 @@ import {
 } from './telegram';
 import logger from './logger';
 import type { TokenCandidate } from './scanner';
+import { getDexScreenerPrice } from './scanner';
 
 // ─── Check Portfolio Stop ─────────────────────────────────────────────────────
 export function checkPortfolioStop(): boolean {
@@ -130,10 +131,24 @@ export async function openPosition(candidate: TokenCandidate): Promise<boolean> 
     return false;
   }
 
-  // Use the scanner's priceUsd (from DexScreener) as the ground-truth entry price.
-  // The trader's result.priceUsd is usdSpent/rawTokenAmount which is incorrect for
-  // tokens with many decimals (e.g. RAY has 6 decimals, so rawAmount is ~35M).
-  const entryPriceUsd = candidate.priceUsd;
+  // Use the scanner's priceUsd as the base entry price, then cross-validate
+  // against DexScreener to catch cases where the scanner got a bad Jupiter quote
+  // (e.g. JUP showing $1059 entry when real price was $0.21).
+  let entryPriceUsd = candidate.priceUsd;
+  try {
+    const livePrice = await getDexScreenerPrice(candidate.mint);
+    if (livePrice && livePrice > 0) {
+      const ratio = entryPriceUsd / livePrice;
+      if (ratio > 5 || ratio < 0.2) {
+        // Scanner price differs >5× from DexScreener — use DexScreener as ground truth
+        logger.warn(
+          `${candidate.symbol} entry price mismatch: scanner $${entryPriceUsd.toFixed(6)} vs DexScreener $${livePrice.toFixed(6)} ` +
+          `(${ratio.toFixed(1)}×) — using DexScreener price to avoid glitched entry`
+        );
+        entryPriceUsd = livePrice;
+      }
+    }
+  } catch (_) { /* non-fatal — proceed with scanner price */ }
 
   // Tiered TP/SL: new tokens get tighter exits; manual trades can override
   const slPct = (candidate as any)._overrideSlPct ?? (candidate.isNewToken ? NEW_TOKEN_STOP_LOSS_PCT : STOP_LOSS_PCT);
@@ -224,10 +239,11 @@ export async function monitorPositions(getCurrentPrice: (mint: string) => Promis
       if (priceUsd > pos.entryPriceUsd * PRICE_SPIKE_MULTIPLIER) {
         logger.warn(
           `${pos.tokenSymbol} suspected price spike: $${pos.entryPriceUsd.toFixed(6)} → $${priceUsd.toFixed(6)} ` +
-          `(${(priceUsd / pos.entryPriceUsd).toFixed(0)}× entry) — cross-validating...`
+          `(${(priceUsd / pos.entryPriceUsd).toFixed(0)}× entry) — cross-validating via DexScreener...`
         );
         await new Promise(r => setTimeout(r, 2_000)); // wait 2s
-        const confirmedSpike = await getCurrentPrice(pos.tokenMint);
+        // Validate using DexScreener (not Jupiter) so a Jupiter glitch can't fool both checks
+        const confirmedSpike = await getDexScreenerPrice(pos.tokenMint);
         if (!confirmedSpike || confirmedSpike < pos.entryPriceUsd * PRICE_SPIKE_MULTIPLIER) {
           // Not confirmed — likely a data glitch, skip this cycle
           logger.info(
@@ -251,14 +267,19 @@ export async function monitorPositions(getCurrentPrice: (mint: string) => Promis
       const recentAvg = (pos.priceHistory ?? []).length > 0
         ? (pos.priceHistory as number[]).reduce((a, b) => a + b, 0) / (pos.priceHistory as number[]).length
         : pos.entryPriceUsd;
-      const crashThreshold = recentAvg * 0.5; // >50% drop from recent avg = suspected glitch
+      // Established tokens (high liquidity, 24h+): flag on >25% drop — real crashes of this
+      // magnitude are rare and DexScreener/Jupiter glitches are common.
+      // New/sniper tokens: keep 50% threshold — smaller caps can move violently.
+      const isEstablished = !(pos as any).isNewToken && !(pos as any).isSniper;
+      const crashThreshold = recentAvg * (isEstablished ? 0.75 : 0.5);
       if (priceUsd < crashThreshold) {
         logger.warn(
           `${pos.tokenSymbol} suspected price crash glitch: recent avg $${recentAvg.toFixed(6)} → $${priceUsd.toFixed(6)} ` +
-          `(${((1 - priceUsd / recentAvg) * 100).toFixed(1)}% drop) — cross-validating...`
+          `(${((1 - priceUsd / recentAvg) * 100).toFixed(1)}% drop, ${isEstablished ? 'established' : 'new/sniper'} threshold) — cross-validating via DexScreener...`
         );
         await new Promise(r => setTimeout(r, 2_000)); // wait 2s
-        const confirmedCrash = await getCurrentPrice(pos.tokenMint);
+        // Use DexScreener (not Jupiter) so a Jupiter glitch can't fool both checks
+        const confirmedCrash = await getDexScreenerPrice(pos.tokenMint);
         if (!confirmedCrash || confirmedCrash >= crashThreshold) {
           // Not confirmed — bad API quote, skip this cycle
           logger.info(
@@ -268,10 +289,14 @@ export async function monitorPositions(getCurrentPrice: (mint: string) => Promis
           updatePosition(pos.id, { currentPriceUsd: confirmedCrash ?? pos.currentPriceUsd ?? pos.entryPriceUsd });
           continue;
         }
-        // Confirmed crash — let normal SL logic handle it
+        // Confirmed crash — let normal SL logic handle it.
+        // Note: if this turns out to be a glitch, the dump cross-validation below
+        // will catch it and `continue` the cycle with the correct price.
         logger.warn(
           `${pos.tokenSymbol} crash CONFIRMED at $${confirmedCrash.toFixed(6)}, proceeding with exit logic`
         );
+        // Use the confirmed crash price going forward (not the original glitched value)
+        // so all downstream checks use the same price.
       }
 
       const pnlPct = (priceUsd - pos.entryPriceUsd) / pos.entryPriceUsd * 100;
@@ -310,9 +335,12 @@ export async function monitorPositions(getCurrentPrice: (mint: string) => Promis
               await executeClose(pos, 'stop_loss', confirmedPrice);
               continue;
             } else {
-              logger.info(`${pos.tokenSymbol} — dump NOT confirmed (confirmed price $${confirmedPrice.toFixed(6)}, likely data glitch). Continuing.`);
-              // Update price history with confirmed price to avoid re-triggering
+              logger.info(`${pos.tokenSymbol} — dump NOT confirmed (confirmed price $${confirmedPrice.toFixed(6)}, likely data glitch). Skipping cycle.`);
+              // Update price history with confirmed price to avoid re-triggering,
+              // then skip the rest of this cycle — priceUsd is still the bad value
+              // and any further checks (TREND DUMP, SL) would fire incorrectly.
               updatePosition(pos.id, { currentPriceUsd: confirmedPrice, priceHistory: [...history.slice(0,-1), confirmedPrice] });
+              continue;
             }
           }
         }

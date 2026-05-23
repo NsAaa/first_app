@@ -720,3 +720,34 @@ export async function getCurrentPrice(mint: string): Promise<number | null> {
 
   return null;
 }
+
+// ─── DexScreener-only Price (for cross-validation) ───────────────────────────
+// Used by spike/crash guards to validate Jupiter prices from a different source.
+// Deliberately skips Jupiter so a Jupiter glitch can't fool both checks.
+export async function getDexScreenerPrice(mint: string): Promise<number | null> {
+  try {
+    const resp = await dexThrottledGet(`${DEXSCREENER_API}/tokens/${mint}`, { timeout: 5_000 });
+    const pairs: any[] = resp.data?.pairs || [];
+    const solana = pairs.filter((p: any) => p.chainId === 'solana');
+    if (solana.length > 0) {
+      solana.sort((a: any, b: any) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+      const price = parseFloat(solana[0].priceUsd || '0');
+      if (price > 0) return price;
+    }
+  } catch (_) {}
+
+  // Birdeye fallback
+  const birdeyeKey = process.env.BIRDEYE_API_KEY;
+  if (birdeyeKey) {
+    try {
+      const resp = await axios.get(`${BIRDEYE_API_URL}?address=${mint}`, {
+        timeout: 5_000,
+        headers: { 'X-Chain': 'solana', 'X-API-KEY': birdeyeKey },
+      });
+      const price = resp.data?.data?.value;
+      if (price && price > 0) return price;
+    } catch (_) {}
+  }
+
+  return null;
+}
