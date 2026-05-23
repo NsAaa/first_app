@@ -20,6 +20,7 @@ import {
   DUMP_LOOKBACK_CYCLES,
   DUMP_TREND_PCT,
   PRICE_SPIKE_MULTIPLIER,
+  BREAKEVEN_TRIGGER_PCT,
   DRY_RUN,
 } from './config';
 import {
@@ -221,7 +222,7 @@ export async function monitorPositions(getCurrentPrice: (mint: string) => Promis
 
   logger.debug(`Monitoring ${openPositions.length} open positions`);
 
-  for (const pos of openPositions) {
+  for (let pos of openPositions) {
     try {
       const priceUsd = await getCurrentPrice(pos.tokenMint);
       if (priceUsd === null) {
@@ -367,6 +368,23 @@ export async function monitorPositions(getCurrentPrice: (mint: string) => Promis
         const newPeak = Math.max(currentPeak, priceUsd);
         if (newPeak > currentPeak) {
           updatePosition(pos.id, { peakPriceUsd: newPeak });
+        }
+      }
+
+      // ─── Breakeven Stop (non-sniper) ──────────────────────────────────────────
+      // Once position gains BREAKEVEN_TRIGGER_PCT (10%), slide SL up to entry price.
+      // One-way ratchet — only moves up, never back down, only fires once.
+      // Snipers skip this — they have no fixed SL, just the trailing stop.
+      if (!pos.isSniper && !pos.noSl && pos.stopLossPrice < pos.entryPriceUsd) {
+        const gainPct = (priceUsd - pos.entryPriceUsd) / pos.entryPriceUsd;
+        if (gainPct >= BREAKEVEN_TRIGGER_PCT) {
+          logger.info(
+            `🔒 ${pos.tokenSymbol} breakeven stop activated — SL moved to entry ` +
+            `$${pos.entryPriceUsd.toFixed(6)} (was $${pos.stopLossPrice.toFixed(6)}) | ` +
+            `position up ${(gainPct * 100).toFixed(1)}%`
+          );
+          updatePosition(pos.id, { stopLossPrice: pos.entryPriceUsd });
+          pos = { ...pos, stopLossPrice: pos.entryPriceUsd }; // update local ref for this cycle
         }
       }
 

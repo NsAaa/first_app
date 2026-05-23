@@ -28,6 +28,7 @@ export const SNIPER_MIN_LIQUIDITY_USD = 5_000;   // $5k minimum liquidity
 export const SNIPER_MIN_VOLUME_USD = 5_000;      // $5k minimum volume
 export const SNIPER_TRAIL_PCT = 0.10;            // 10% trailing stop from highest price seen
 export const TIER_TRAIL_PCT = 0.10;              // 10% trailing stop from peak for new + established tiers
+export const BREAKEVEN_TRIGGER_PCT = 0.10;       // once up 10%, slide SL to entry (breakeven stop)
 export const SNIPER_MAX_MCAP_USD = 10_000_000;   // max $10M mcap (true micro caps)
 // Consolidation check: token must be "settling" not mid-pump or mid-dump
 export const SNIPER_MAX_5M_CHANGE_PCT = 5;       // 5min price change must be < ±5% (consolidating)
